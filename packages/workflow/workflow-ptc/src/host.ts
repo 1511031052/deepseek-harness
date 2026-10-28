@@ -1,12 +1,23 @@
 /** Workflow child ownership and progress over the shared sandboxed PTC executor. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-working-directory'
 import type { PtcBindingFunction, PtcJsonValue, PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type SubagentRuntime from '@deepseek-ai/dsh-subagent'
+import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import type { SubagentActivation } from '@deepseek-ai/dsh-subagent'
+import {
+  assertAllowedModelSelection,
+  hasDelegationModelRequest,
+  preflightChildLlmRoute,
+  requestedAgentOptions,
+  requireSubagentModelSelectionPolicy,
+} from '@deepseek-ai/dsh-subagent/model-selection'
+import type { DelegationModelRequest } from '@deepseek-ai/dsh-subagent/model-selection'
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import { assertNever, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
@@ -47,6 +58,7 @@ function childRequest(value: unknown): ChildStartRequest {
   const prompt = text(request.prompt, 'prompt')
   const provider = request.provider === undefined ? undefined : text(request.provider, 'provider')
   const model = request.model === undefined ? undefined : text(request.model, 'model')
+  const reasoningEffort = request.reasoning_effort === undefined ? undefined : text(request.reasoning_effort, 'reasoning_effort')
   let schema: ObjectJsonSchema | undefined
   if (request.schema !== undefined) {
     const candidate = object(request.schema)
@@ -57,6 +69,7 @@ function childRequest(value: unknown): ChildStartRequest {
     prompt,
     ...provider === undefined ? {} : { provider },
     ...model === undefined ? {} : { model },
+    ...reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort },
     ...schema === undefined ? {} : { schema },
   }
 }
@@ -200,6 +213,7 @@ export class PtcWorkflowRun implements WorkflowRun {
   private async startChild(request: ChildStartRequest): Promise<PtcJsonValue> {
     this.requireActive()
     const callId = ++this.started
+    const agentOptions = await this.childAgentOptions(request)
     const run = await this.subagents.startActivation({
       provider: this.provider,
       label: `${this.meta.name} child ${callId}`,
@@ -210,12 +224,7 @@ export class PtcWorkflowRun implements WorkflowRun {
         prompt: [{ type: 'text', text: request.prompt }],
         parent: this.parent,
         ...request.schema === undefined ? {} : { outputSchema: request.schema },
-        ...request.provider === undefined && request.model === undefined ? {} : {
-          agentOptions: {
-            ...request.provider === undefined ? {} : { provider: request.provider },
-            ...request.model === undefined ? {} : { model: request.model },
-          },
-        },
+        ...agentOptions === undefined ? {} : { agentOptions },
       },
     })
     const record: ChildRecord = { callId, run }
@@ -226,6 +235,36 @@ export class PtcWorkflowRun implements WorkflowRun {
       throw new Error('workflow child started after cancellation')
     }
     return { callId, childId: run.childId }
+  }
+
+  /**
+   * Resolve one child's Agent options from the script's explicit route fields.
+   * Omission keeps the inherited-route behavior: no `agentOptions` reach the
+   * provider. Any explicit field must resolve against the Session's recorded
+   * allowlist and the live adapter before the child exists, so an unauthorized
+   * or unadvertised selection fails here instead of falling back.
+   */
+  private async childAgentOptions(request: ChildStartRequest): Promise<AgentOptions | undefined> {
+    const selection: DelegationModelRequest = {
+      ...request.provider === undefined ? {} : { provider: request.provider },
+      ...request.model === undefined ? {} : { model: request.model },
+      ...request.reasoning_effort === undefined ? {} : { reasoning_effort: request.reasoning_effort },
+    }
+    if (!hasDelegationModelRequest(selection)) return undefined
+    const projections = this.ctx.get('sessionProjections')
+    if (projections === undefined) {
+      throw new Error('cannot select a workflow child LLM route because the `sessionProjections` service is unavailable')
+    }
+    const allowedModels = requireSubagentModelSelectionPolicy(projections, this.parent.session)
+    const parentOptions = parentAgentOptionsForDelegation(this.parent)
+    const requested = requestedAgentOptions(parentOptions, undefined, selection, true)
+    assertAllowedModelSelection({ routes: allowedModels }, parentOptions, requested, selection)
+    const llm = this.ctx.get('llm')
+    if (llm === undefined) {
+      throw new Error('cannot resolve the selected workflow child LLM route because the `llm` service is unavailable')
+    }
+    await preflightChildLlmRoute(llm, parentOptions, requested, this.controller.signal)
+    return requested
   }
 
   private async childResult(record: ChildRecord): Promise<PtcJsonValue> {

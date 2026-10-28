@@ -123,7 +123,7 @@ Lead 可以停止 teammate 的当前轮次，而不会删除其排队的消息�
 
 ### Team 身份与 roster
 
-每个普通运行时 root 都是一个隐式 Team 的 Lead，其 `TeamId` 等于 `SessionId`；不存在创建事件，持久 Team 状态从第一条成员或任务记录开始。`spawnTeammate()` 先追加并 flush 一条 `provisioning` 成员记录，再要求配置的提供方创建预留 child；提供方失败会追加一条持久的 `failed` 成员。fresh child 不携带 Lead 历史；fork child 只捕获一次 Lead 的已完成 turn 前缀。恢复把未终结的 provisioning 记录对照 child 独立持久化的会话进行对账：直接 parent 与 continuable descriptor 匹配、且初始用户消息已记录则产生 `active`，其他任何情况都产生 `failed`。如果恢复在同进程竞争中先完成，creator 会接受终态，或报告 `TEAM_PROVISIONING_CONFLICT` 并 drain 该 child。名字由第一条 provisioning 记录保留，且永不复用。
+每个普通运行时 root 都是一个隐式 Team 的 Lead，其 `TeamId` 等于 `SessionId`；不存在创建事件，持久 Team 状态从第一条成员或任务记录开始。`spawnTeammate()` 先追加并 flush 一条 `provisioning` 成员记录，再要求配置的提供方创建预留 child；提供方失败会追加一条持久的 `failed` 成员。fresh child 可通过可选 `agentOptions` 固定自己的 LLM 路由，省略整个字段才继承 Lead 路由。`provider` 与 `model` 必须成对且非空，并在写入成员记录之前校验；路由不变时单独给 reasoning effort 会覆盖继承的 effort，改变路由却不给 effort 则使用新模型的默认值。显式选择要求调用 Session 已记录 model-selection 策略；没有策略时 `spawn_teammate` 会在创建任何成员之前拒绝，而不是回退到继承路由。fork child 只捕获一次 Lead 的已完成 turn 前缀，因此拒绝显式 provider、model 或 reasoning-effort。任何子会话继承父上下文的传输 provider 同样拒绝这些显式值，即使请求声明的是 fresh context；`maxTokens` 等非路由选项仍然可用。恢复把未终结的 provisioning 记录对照 child 独立持久化的会话进行对账：直接 parent 与 continuable descriptor 匹配、且初始用户消息已记录则产生 `active`，其他任何情况都产生 `failed`。如果恢复在同进程竞争中先完成，creator 会接受终态，或报告 `TEAM_PROVISIONING_CONFLICT` 并 drain 该 child。名字由第一条 provisioning 记录保留，且永不复用。
 
 ### 直接消息与历史兼容
 

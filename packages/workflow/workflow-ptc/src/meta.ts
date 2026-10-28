@@ -35,18 +35,28 @@ function validateMetaShape(meta: unknown): { meta?: WorkflowMeta; violations: st
         }
         const entry = phase as Record<string, unknown>
         for (const key of Object.keys(entry)) {
-          if (!['title', 'detail', 'provider', 'model'].includes(key)) violations.push(`meta.phases[${index}].${key} is not a recognized field`)
+          if (!['title', 'detail', 'provider', 'model', 'reasoning_effort'].includes(key)) violations.push(`meta.phases[${index}].${key} is not a recognized field`)
         }
         if (typeof entry.title !== 'string' || entry.title.length === 0) violations.push(`meta.phases[${index}].title must be a non-empty string`)
         if (entry.detail !== undefined && typeof entry.detail !== 'string') violations.push(`meta.phases[${index}].detail must be a string`)
         if (entry.provider !== undefined && typeof entry.provider !== 'string') violations.push(`meta.phases[${index}].provider must be a string`)
         if (entry.model !== undefined && typeof entry.model !== 'string') violations.push(`meta.phases[${index}].model must be a string`)
+        if (entry.reasoning_effort !== undefined && typeof entry.reasoning_effort !== 'string') violations.push(`meta.phases[${index}].reasoning_effort must be a string`)
+        if (entry.provider === '') violations.push(`meta.phases[${index}].provider must be non-empty`)
+        if (entry.model === '') violations.push(`meta.phases[${index}].model must be non-empty`)
+        if (entry.reasoning_effort === '') violations.push(`meta.phases[${index}].reasoning_effort must be non-empty`)
+        // A phase route is the default for its agents, so half a route would only
+        // surface later as an agent()-time failure.
+        if ((entry.provider === undefined) !== (entry.model === undefined)) {
+          violations.push(`meta.phases[${index}] must supply provider and model together`)
+        }
         if (violations.length === 0) {
           phases.push({
             title: entry.title as string,
             ...entry.detail !== undefined ? { detail: entry.detail as string } : {},
             ...entry.provider !== undefined ? { provider: entry.provider as string } : {},
             ...entry.model !== undefined ? { model: entry.model as string } : {},
+            ...entry.reasoning_effort !== undefined ? { reasoning_effort: entry.reasoning_effort as string } : {},
           })
         }
       })

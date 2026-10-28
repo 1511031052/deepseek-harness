@@ -33,8 +33,8 @@ describe('validateMeta', () => {
       description: 'migrate call sites',
       whenToUse: 'large mechanical sweeps',
       phases: [
-        { title: 'Discover', provider: 'openai' },
-        { title: 'Transform', detail: 'one agent per file', model: 'deepseek-v4-pro' },
+        { title: 'Discover', provider: 'openai', model: 'gpt-small' },
+        { title: 'Transform', detail: 'one agent per file', provider: 'deepseek', model: 'deepseek-v4-pro', reasoning_effort: 'max' },
       ],
     })
     expect(meta).toEqual({
@@ -42,8 +42,8 @@ describe('validateMeta', () => {
       description: 'migrate call sites',
       whenToUse: 'large mechanical sweeps',
       phases: [
-        { title: 'Discover', provider: 'openai' },
-        { title: 'Transform', detail: 'one agent per file', model: 'deepseek-v4-pro' },
+        { title: 'Discover', provider: 'openai', model: 'gpt-small' },
+        { title: 'Transform', detail: 'one agent per file', provider: 'deepseek', model: 'deepseek-v4-pro', reasoning_effort: 'max' },
       ],
     })
   })
@@ -75,6 +75,21 @@ describe('validateMeta', () => {
     expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', detail: 9 }] }, 'meta.phases[0].detail must be a string')
     expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', provider: 9 }] }, 'meta.phases[0].provider must be a string')
     expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', model: 9 }] }, 'meta.phases[0].model must be a string')
+    expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', reasoning_effort: 9 }] }, 'meta.phases[0].reasoning_effort must be a string')
+    expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', provider: '' }] }, 'meta.phases[0].provider must be non-empty')
+    expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', model: '' }] }, 'meta.phases[0].model must be non-empty')
+    expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', reasoning_effort: '' }] }, 'meta.phases[0].reasoning_effort must be non-empty')
+    expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', provider: 'openai' }] }, 'meta.phases[0] must supply provider and model together')
+    expectInvalid({ name: 'x', description: 'd', phases: [{ title: 'Scan', model: 'small' }] }, 'meta.phases[0] must supply provider and model together')
+  })
+
+  it('keeps an effort without a route legal because it applies to the inherited route', () => {
+    const meta = validateMeta({
+      name: 'review',
+      description: 'adversarial review',
+      phases: [{ title: 'Check', reasoning_effort: 'max' }],
+    })
+    expect(meta.phases).toEqual([{ title: 'Check', reasoning_effort: 'max' }])
   })
 
   it('names EVERY violation in one throw, not just the first', () => {

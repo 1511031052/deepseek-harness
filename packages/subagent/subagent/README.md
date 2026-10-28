@@ -103,10 +103,19 @@ This section explains how the service is built and where the observable behavior
 | [`src/descriptor.ts`](src/descriptor.ts) | Versioned `subagent/descriptor` session-event vocabulary |
 | [`src/catalog.ts`](src/catalog.ts) | Parent-owned `subagent/catalog` event and chunked host projection |
 | [`src/child-agent.ts`](src/child-agent.ts) | Child composition, delegated policy, depth helpers |
+| [`src/model-selection.ts`](src/model-selection.ts) | Shared child LLM route vocabulary, Session allowlist policy, adapter preflight, and the execution-boundary guard (`@deepseek-ai/dsh-subagent/model-selection`) |
 | [`src/list-children.ts`](src/list-children.ts) | Direct and recursive parent-catalog reads |
 | [`src/control.ts`](src/control.ts) | Browser control request validation and stable failure codes |
 | [`src/control-types.ts`](src/control-types.ts) | Client-safe catalog row, control requests, receipts, and failures |
 | [`src/archive-admission.ts`](src/archive-admission.ts) | The `subagent` family of the Workspace registry's archive admission: running descendants and their parent-cause cancel |
+
+### Shared child LLM route selection
+
+Every delegation path that can select a child route uses the same rules from `@deepseek-ai/dsh-subagent/model-selection`: the `subagent` tool and the workflow engine check at their model-facing entry points, the Team tool forwards its route options to the service, and `startActivation` checks again at the execution boundary. That module owns the exact-route vocabulary, the provider/model pairing rule, the merge of model-facing overrides over configured defaults (a route change without an effort clears the previous route-owned effort), the live `llm.resolveCallConfig` preflight, and the Session allowlist assertion.
+
+The allowlist itself is durable Session state: a model-selectable definition records `subagent/model-selection-policy` once, the `subagentModelSelectionPolicy` host projection folds it, and `subagentModelSelectionPolicy()` reads the detached route list. The subagent service registers that projection; definition owners and consumers never register it again. A model-facing consumer that receives an explicit route or effort field must require that policy (`requireSubagentModelSelectionPolicy()`) and fail when the Session has none — explicit selection at those entry points never falls back to the inherited route.
+
+`startActivation` independently resolves every explicit `request.agentOptions` before any provider creates a child. With a recorded policy, the effective provider/model must match an allowed route, and a missing effective route or unadvertised effort fails there; a non-allowlisted route never falls back. Without a recorded policy, a direct service caller keeps the pre-policy configuration and service compatibility path: explicit configured values still work, subject to the live adapter preflight. The model-facing tool and workflow engine continue to reject explicit selection without a policy before they call the service. Explicit selection requires the `sessionProjections` service to know whether a policy exists; a composition without it rejects rather than bypassing the allowlist. Pure inheritance and a `maxTokens`-only override read no policy and run no route preflight.
 
 ### Provider preparation and structured output
 

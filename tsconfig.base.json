@@ -1,4 +1,4 @@
-{
+﻿{
   // Doubles as the resolution facade for vite-tsconfig-paths (vitest configs
   // point here). NEVER add include/files to this file: it would leak into
   // every extending package project and narrow the facade's match-all scope.
@@ -154,6 +154,7 @@
       "@deepseek-ai/dsh-session-title/client": ["./packages/session/session-title/src/client.ts"],
       "@deepseek-ai/dsh-subagent/client": ["./packages/subagent/subagent/src/client.ts"],
       "@deepseek-ai/dsh-subagent/internal": ["./packages/subagent/subagent/src/internal.ts"],
+  "@deepseek-ai/dsh-subagent/model-selection": ["./packages/subagent/subagent/src/model-selection.ts"],
       "@deepseek-ai/dsh-workspace/types": ["./packages/workspace/workspace/src/types.ts"],
       "@deepseek-ai/dsh-util-workspace-path": ["./packages/util/workspace-path/src/index.ts"],
       "@deepseek-ai/dsh-session-stats/types": ["./packages/session/session-stats/src/types.ts"],

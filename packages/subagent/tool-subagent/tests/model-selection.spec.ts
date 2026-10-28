@@ -16,7 +16,7 @@ import {
   assertAllowedModelRoutes,
   assertAllowedModelSelection,
   preflightChildLlmRoute,
-} from '../src/model-selection.ts'
+} from '@deepseek-ai/dsh-subagent/model-selection'
 import { callSubagent, modelSelectionSetupAgent, setup, text } from './harness.ts'
 
 const REASONING = {
@@ -367,6 +367,21 @@ describe('dsh-tool-subagent model selection', () => {
     )
     expect(result.isError).toBe(true)
     expect(text(result)).toContain('does not support reasoning effort "high"')
+    expect(starts).toBe(0)
+  })
+
+  it('rejects configured agent options outside the Session allowlist before child creation', async () => {
+    let starts = 0
+    const ctx = await setup({
+      provider: 'mock',
+      withModelSelection: true,
+      agentOptions: { provider: 'alpha', model: 'not-in-policy' },
+    }, { onStart: () => { starts += 1 } })
+    ctx.llm.registerAdapter(['alpha'], new MockAdapter([], REASONING))
+
+    const result = await callSubagent(ctx, { description: 'configured route', prompt: 'do it' })
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('child LLM route "alpha/not-in-policy" is not allowed for this Session')
     expect(starts).toBe(0)
   })
 

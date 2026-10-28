@@ -37,7 +37,7 @@ import { scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
 import { assertObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock, MessageId, MessageSource } from '@deepseek-ai/dsh-llm'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { canonicalClientTimeZone } from '@deepseek-ai/dsh-util-time'
 import { Remote, RemoteError, TypertRemoteService, principalOf, type Principal } from '@deepseek-ai/dsh-typert-protocol'
@@ -66,6 +66,15 @@ import type {
 } from './types.ts'
 import { SubagentError } from './error.ts'
 import { assertSubagentMaxDepth } from './depth.ts'
+import { parentAgentOptionsForDelegation } from './child-agent.ts'
+import {
+  assertAllowedModelSelection,
+  hasConfiguredLlmSelection,
+  preflightChildLlmRoute,
+  subagentModelSelectionPolicy,
+  subagentModelSelectionProjectionDefinition,
+} from './model-selection.ts'
+import type { DelegationModelRequest } from './model-selection.ts'
 import { createActivationObserver, createLifecycleEmitter } from './lifecycle.ts'
 import type { ActivationObserver, LifecycleEmitter } from './lifecycle.ts'
 import SubagentManager from './manager.ts'
@@ -182,6 +191,21 @@ interface BrowserPromptSource {
   readonly principal?: Principal
 }
 
+/**
+ * Project stored child options onto the model-facing selection vocabulary used
+ * by the shared allowlist assertion. Presence alone is significant; the
+ * assertion resolves values from the effective child options.
+ * @param options - explicit child options already known to select a route or effort.
+ * @returns the matching model-facing selection fields.
+ */
+function delegationModelRequestOf(options: AgentOptions): DelegationModelRequest {
+  return {
+    ...options.provider === undefined ? {} : { provider: options.provider },
+    ...options.model === undefined ? {} : { model: options.model },
+    ...options.reasoningEffort === undefined ? {} : { reasoning_effort: options.reasoningEffort },
+  }
+}
+
 /** Host configuration for continuable subagent capacity. */
 export interface Config {
   /** Maximum live children sharing uninterrupted continuable parent links; defaults to 8. */
@@ -228,6 +252,7 @@ export class SubagentRuntime extends TypertRemoteService {
       projectionCtx.sessionProjections.register(subagentCatalogProjectionDefinition)
       projectionCtx.sessionProjections.register(subagentTimingProjectionDefinition)
       projectionCtx.sessionProjections.register(subagentIdentityProjectionDefinition)
+      projectionCtx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
     })
     // Archive admission: this runtime is the owner that knows which live
     // children descend from a Session and how a parent stops them.
@@ -278,6 +303,9 @@ export class SubagentRuntime extends TypertRemoteService {
       throw new SubagentError('subagent creation requires the exact live parent agent', 'UNAUTHORIZED')
     }
     if (spec.request.outputSchema !== undefined) assertObjectJsonSchema(spec.request.outputSchema)
+    // Keep the inherited-route path synchronous with the pre-policy service:
+    // local creation captures delegated policy before its first await.
+    if (hasConfiguredLlmSelection(spec.request.agentOptions)) await this.assertChildLlmSelection(spec)
     return provider.prepareContinuable === undefined
       ? manager.startExternal(spec)
       : manager.startLocal(spec)
@@ -625,6 +653,47 @@ export class SubagentRuntime extends TypertRemoteService {
     parent: Agent,
   ): ActivationObserver {
     return createActivationObserver(this.emitLifecycle, provider, childId, parent)
+  }
+
+  /**
+   * Resolve explicit child LLM options against the parent Session's durable
+   * allowlist and the live adapter before any provider creates a child.
+   * A recorded policy must authorize the effective provider/model route and the
+   * selected effort must be advertised by that route. A Session without a
+   * recorded policy keeps the configuration and service compatibility path:
+   * explicit options still pass the live preflight, but there is no allowlist
+   * to enforce. Consumers that parse model-facing selection keep their own
+   * fail-closed policy requirement before they call this service.
+   * Explicit selection requires the `sessionProjections` service to know
+   * whether a policy exists; a composition without it rejects rather than
+   * bypassing the allowlist. Pure inheritance, including a `maxTokens`-only
+   * override, reads no policy and runs no preflight.
+   * @param spec - activation whose explicit child options are resolved.
+   * @returns after the effective route is authorized and resolvable.
+   */
+  private async assertChildLlmSelection(spec: SubagentActivationSpec): Promise<void> {
+    const requested = spec.request.agentOptions
+    if (requested === undefined || !hasConfiguredLlmSelection(requested)) return
+    const parent = spec.request.parent
+    const parentOptions = parentAgentOptionsForDelegation(parent)
+    const projections = this.ctx.get('sessionProjections')
+    if (projections === undefined) {
+      throw new Error('cannot authorize explicit child LLM selection because the `sessionProjections` service is unavailable')
+    }
+    const routes = subagentModelSelectionPolicy(projections, parent.session)
+    if (routes !== undefined) {
+      assertAllowedModelSelection({ routes }, parentOptions, requested, delegationModelRequestOf(requested))
+    }
+    const llm = this.ctx.get('llm')
+    if (llm === undefined) {
+      throw new Error('cannot resolve the selected child LLM route because the `llm` service is unavailable')
+    }
+    // Validate only what this request states. An unchanged route inherits the
+    // parent's already-effective effort, and a changed route resolves the
+    // selected model's default; neither is an explicit child selection, and
+    // provider-owned route defaults must not be re-authorized against an
+    // effort the child will not inherit.
+    await preflightChildLlmRoute(llm, parentOptions, requested, spec.signal, false)
   }
 
   /** Reject the first requested capability that the provider lacks. */

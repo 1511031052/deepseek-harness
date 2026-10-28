@@ -2,6 +2,7 @@
 
 import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { Branded } from '@deepseek-ai/dsh-brand'
+import type { AgentOptions } from '@deepseek-ai/dsh-agent'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
@@ -62,8 +63,10 @@ export interface TeamMemberView {
   readonly role: 'lead' | 'teammate'
   readonly status: 'running' | 'inactive' | 'provisioning' | 'failed'
   readonly description?: string
+  /** Creation transport provider that started this member, never its LLM provider. */
   readonly provider?: string
   readonly context?: 'fresh' | 'fork'
+  /** Reported model for this row: the live child's model, omitted while that child is not live; the member Session header is authoritative. */
   readonly model?: string
   readonly diagnostics: string[]
 }
@@ -167,7 +170,22 @@ export interface SpawnTeammateRequest {
   readonly description: string
   readonly prompt: ContentBlock[]
   readonly context: 'fresh' | 'fork'
+  /** Creation transport provider, for example `spawn` or `fork`; never an LLM provider. */
   readonly provider: string
+  /**
+   * Optional child Agent creation options: LLM provider, model, reasoning
+   * effort, and output-token cap. Omitting the whole field inherits the Lead's
+   * values. Provider and model are one pair and must be non-empty; a lone
+   * reasoning effort is valid and overrides an inherited effort only while the
+   * route is unchanged. Explicit selection through the Team tool requires the
+   * calling Session to have recorded a model-selection policy; the subagent
+   * runtime then authorizes the effective route together with the live adapter
+   * preflight. A `fork` context, and any provider whose children inherit the
+   * parent context, rejects explicit provider, model, or reasoning-effort
+   * values because that seeded prefix keeps one route; non-route options such
+   * as `maxTokens` stay available.
+   */
+  readonly agentOptions?: AgentOptions
   readonly signal: AbortSignal
 }
 

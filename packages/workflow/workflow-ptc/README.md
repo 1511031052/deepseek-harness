@@ -54,6 +54,10 @@ The script runs with top-level `await`; `meta` and `args` arrive as JSON data. E
 
 Invalid metadata, an unparseable body, an unavailable provider route or a per-run cap above the ceiling is rejected before a run is published. During execution, hook misuse and tripped cooperative caps fail the workflow. Process failures, unavailable required confinement and PTC output or control limits also fail the run.
 
+### Child LLM routes
+
+Each `agent()` call may name `provider` and `model` together plus an optional `reasoning_effort`; a `meta.phases` entry may declare the same three fields as the default route and effort for agents whose phase title matches. A field given on the call is an explicit selection that overrides that phase default. An explicit route must appear in the calling Session's recorded model-selection allowlist; `reasoning_effort` is not an allowlist member — the live LLM adapter validates it against the efforts the resolved model advertises. Both resolve before the child is created, so an unauthorized, unpaired, or unsupported selection fails the script instead of falling back. Omitting all three fields inherits the parent Agent route and effort only when the matching phase declares neither; a phase route or effort is the call's default otherwise. Changing the route without an effort never inherits the previous effort: the selected model resolves its own default, and a phase effort applies only while the call keeps that phase's route.
+
 ### File policy and cancellation
 
 The engine captures the calling Session's effective working directory and standing file policy separately. The PTC process and every child started by that workflow retain the captured directory when the parent later moves. A runtime without confinement is accepted only for `danger-full-access`; `read-only` and `workspace-write` fail before execution. Node in-memory mode executes an async wrapper in a temporary environment, so workflow-local variables never join the Agent's retained REPL. The VM retains the documented helper API, but it is not a security boundary: code that reaches Node follows the selected runtime's file policy. The program-visible environment is empty. Network access is not restricted by the file policy.
@@ -121,7 +125,7 @@ Use these references for the shared execution guarantees and workflow contracts.
 
 #### What the model sees
 
-Every script `agent()` call sends its prompt verbatim and optional model or structured-output schema to a subagent provider. Each child sees that provider's own context; phase and log narration stays on observer events.
+Every script `agent()` call sends its prompt verbatim, an optional structured-output schema, and (when the call or its phase declares one) an explicit provider/model route that must appear in the Session's allowlist plus an optional reasoning effort that the resolved model must advertise. Each child sees that provider's own context; phase and log narration stays on observer events.
 
 #### Token effect
 

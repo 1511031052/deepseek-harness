@@ -165,6 +165,15 @@ export interface SubagentStartRequest {
    * providers merge them over the parent Agent's options when they create the
    * child, while the DSH SDK provider merges them over its instance defaults
    * before initializing the separate child runtime.
+   *
+   * Selecting a provider, model, or reasoning effort is checked by the
+   * subagent service before any provider creates a child. When the parent
+   * Session recorded a model-selection policy, the effective provider/model
+   * must be authorized and the selected effort must be advertised by that
+   * route. A Session without a recorded policy keeps the configuration and
+   * service compatibility path and only requires the live adapter preflight;
+   * model-facing consumers apply their own fail-closed policy requirement.
+   * A `maxTokens`-only override and pure inheritance take neither path.
    */
   readonly agentOptions?: AgentOptions
   /**

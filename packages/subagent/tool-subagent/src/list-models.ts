@@ -4,7 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type LlmRuntime from '@deepseek-ai/dsh-llm'
 import type { LlmProviderInfo } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { ModelSelectionPolicy } from './model-selection.ts'
+import type { ModelSelectionPolicy } from '@deepseek-ai/dsh-subagent/model-selection'
 
 interface ListSubagentModelsRequest {
   readonly provider?: string
@@ -88,14 +88,14 @@ export function registerListSubagentModels(ctx: Context, policy: ModelSelectionP
     name: 'list_subagent_models',
     description:
       'Discover LLM routes for subagents without changing the current Agent. Call with no arguments to list '
-      + 'registered providers, with `provider` to list its advertised models, or with `provider` and `model` '
+      + 'the providers allowlisted for this Session, with `provider` to list its advertised models, or with `provider` and `model` '
       + 'to inspect that exact model and its reasoning efforts. Catalog membership is advisory: an adapter may '
       + 'accept an unlisted model id. Use the returned ids with a delegation tool\'s `provider`, `model`, and '
       + '`reasoning_effort` fields.',
     parameters: {
       provider: {
         type: 'string',
-        description: 'Registered LLM provider id. Omit to list providers.',
+        description: 'Allowlisted LLM provider id. Omit to list this Session\'s allowlisted providers.',
       },
       model: {
         type: 'string',

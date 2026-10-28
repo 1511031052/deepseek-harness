@@ -40,10 +40,15 @@ export interface ChildStartRequest {
   prompt: string
   /** The structured-output schema, if the call passed one (already subset-checked). */
   schema?: ObjectJsonSchema
-  /** The per-child provider override, if the call passed one. */
+  /** The effective provider override (agent options or its phase default), if any. */
   provider?: string
-  /** The per-child model override, if the call passed one. */
+  /** The effective model override (agent options or its phase default), if any. */
   model?: string
+  /**
+   * The effective reasoning-effort override (agent options or its phase
+   * default) for the selected route, if any.
+   */
+  reasoning_effort?: string
 }
 
 /**

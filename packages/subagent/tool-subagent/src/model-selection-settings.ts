@@ -1,4 +1,4 @@
-/** Host-owned opt-in setting for model-selectable subagent delegation. */
+﻿/** Host-owned opt-in setting for model-selectable subagent delegation. */
 import type { Volatile } from '@deepseek-ai/cordis'
 
 import { Context, Service } from '@deepseek-ai/cordis'
@@ -7,7 +7,7 @@ import {
   AllowedModelRouteSchema,
   assertAllowedModelRoutes,
   type AllowedModelRoute,
-} from './model-selection.ts'
+} from '@deepseek-ai/dsh-subagent/model-selection'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {

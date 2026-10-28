@@ -3,10 +3,11 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
 import { SessionLogOffset, SessionId, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SubagentService from '@deepseek-ai/dsh-subagent'
@@ -24,6 +25,15 @@ import { TestSessionQuery } from './test-session-query.ts'
 const SIGNAL = new AbortController().signal
 const roots: string[] = []
 const contexts: Context[] = []
+
+/** Adapter reasoning metadata that lets a Lead carry and a child override a real effort. */
+const REASONING_EFFORTS: LlmModelReasoningInfo = {
+  efforts: [
+    { id: ReasoningEffortId('low'), name: 'low' },
+    { id: ReasoningEffortId('high'), name: 'high' },
+    { id: ReasoningEffortId('max'), name: 'max' },
+  ],
+}
 
 afterEach(async () => {
   vi.useRealTimers()
@@ -62,6 +72,8 @@ async function storedEvents(ctx: Context, id: SessionId): Promise<readonly Sessi
 async function setup(
   script: ConstructorParameters<typeof MockAdapter>[0],
   config: ConstructorParameters<typeof TeamService>[1] = {},
+  reasoning?: LlmModelReasoningInfo,
+  leadOptions: AgentOptions = {},
 ) {
   const ctx = new Context()
   contexts.push(ctx)
@@ -76,9 +88,9 @@ async function setup(
   await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
   await ctx.plugin(SubagentFork, { providerName: 'fork' })
   const teamFiber = await ctx.plugin(TeamService, config)
-  const adapter = new MockAdapter(script)
+  const adapter = new MockAdapter(script, reasoning)
   ctx.llm.registerAdapter(['mock'], adapter)
-  const lead = await ctx.agentLoop.create(SessionId('lead'), { provider: 'mock', model: 'mock' })
+  const lead = await ctx.agentLoop.create(SessionId('lead'), { provider: 'mock', model: 'mock', ...leadOptions })
   return { ctx, lead, adapter, storageRoot, teamFiber }
 }
 
@@ -115,7 +127,7 @@ function spawn(
   ctx: Context,
   lead: Agent,
   name: string,
-  options: { context?: 'fresh' | 'fork'; provider?: string } = {},
+  options: { context?: 'fresh' | 'fork'; provider?: string; agentOptions?: AgentOptions } = {},
 ) {
   const context = options.context ?? 'fresh'
   return ctx.agentTeams.spawnTeammate(lead, {
@@ -124,6 +136,7 @@ function spawn(
     prompt: content(`${name} initial`),
     context,
     provider: options.provider ?? (context === 'fork' ? 'fork' : 'spawn'),
+    ...options.agentOptions === undefined ? {} : { agentOptions: options.agentOptions },
     signal: SIGNAL,
   })
 }
@@ -1464,5 +1477,158 @@ describe('Team direct messages and waiting', () => {
     expect(durable(second.lead).members[0]).toMatchObject({
       phase: 'failed', error: 'settled elsewhere',
     })
+  })
+})
+
+describe('Team creation LLM options', () => {
+  it('forwards explicit creation options and produces the routed adapter request', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('routed answer')], {}, REASONING_EFFORTS)
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const started = await spawn(ctx, lead, 'routed', {
+      agentOptions: { provider: 'mock', model: 'mock-routed', reasoningEffort: ReasoningEffortId('max') },
+    })
+    expect(startActivation.mock.calls[0]?.[0].request).toMatchObject({
+      agentOptions: { provider: 'mock', model: 'mock-routed', reasoningEffort: 'max' },
+    })
+    expect(ctx.agentTeams.listMembers(lead)[1]).toMatchObject({
+      name: 'routed',
+      provider: 'spawn',
+      context: 'fresh',
+    })
+    await waitNoAgent(ctx, started.member.id)
+    expect(adapter.requests[0]?.model).toBe('mock-routed')
+    expect(adapter.requests[0]?.reasoningEffort).toBe('max')
+  })
+
+  it('keeps inheritance when creation options are omitted', async () => {
+    const { ctx, lead } = await setup([textResponse('inherited answer')])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    await spawn(ctx, lead, 'inherited')
+    expect(startActivation.mock.calls[0]?.[0].request).not.toHaveProperty('agentOptions')
+  })
+
+  it('passes a fork creation option that selects no route', async () => {
+    const { ctx, lead } = await setup([textResponse('lead answer'), textResponse('fork answer')])
+    lead.followup(createUserMessage({ content: content('lead turn'), source: { kind: 'user' } }))
+    await lead.whenIdle()
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    await spawn(ctx, lead, 'fork-budget', { context: 'fork', agentOptions: { maxTokens: 256 } })
+    expect(startActivation.mock.calls[0]?.[0].request).toMatchObject({ agentOptions: { maxTokens: 256 } })
+    const agentOptions = startActivation.mock.calls[0]?.[0].request.agentOptions
+    expect(agentOptions).not.toHaveProperty('provider')
+    expect(agentOptions).not.toHaveProperty('model')
+    expect(agentOptions).not.toHaveProperty('reasoningEffort')
+  })
+
+  it('rejects explicit creation options for a fork teammate before creating it', async () => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    await expect(spawn(ctx, lead, 'forked', {
+      context: 'fork',
+      agentOptions: { provider: 'mock', model: 'mock-routed' },
+    })).rejects.toThrow(/fork teammates cannot select an explicit LLM route/u)
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(ctx.agentTeams.listMembers(lead).map(member => member.name)).toEqual(['lead'])
+    expect(durable(lead).members).toEqual([])
+  })
+
+  it('rejects an effort-only creation option for a fork teammate before creating it', async () => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    await expect(spawn(ctx, lead, 'fork-effort', {
+      context: 'fork',
+      agentOptions: { reasoningEffort: ReasoningEffortId('max') },
+    })).rejects.toMatchObject({ code: 'TEAM_FORK_ROUTE_UNSUPPORTED' })
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(durable(lead).members).toEqual([])
+  })
+
+  it.each([
+    ['provider without model', { provider: 'mock' }],
+    ['model without provider', { model: 'mock-routed' }],
+    ['empty provider', { provider: '', model: 'mock-routed' }],
+    ['empty model', { provider: 'mock', model: '' }],
+  ] as const)('rejects %s before recording a member', async (_label, agentOptions) => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    await expect(spawn(ctx, lead, 'invalid-route', { agentOptions }))
+      .rejects.toMatchObject({ code: 'TEAM_INVALID_ARGUMENT' })
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(durable(lead).members).toEqual([])
+    expect(ctx.agentTeams.listMembers(lead).map(member => member.name)).toEqual(['lead'])
+  })
+
+  it('rejects an explicit route for a transport provider that inherits parent context', async () => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    await expect(spawn(ctx, lead, 'fork-transport', {
+      provider: 'fork',
+      agentOptions: { provider: 'mock', model: 'mock-routed' },
+    })).rejects.toMatchObject({ code: 'TEAM_FORK_ROUTE_UNSUPPORTED' })
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(durable(lead).members).toEqual([])
+    expect(ctx.agentTeams.listMembers(lead).map(member => member.name)).toEqual(['lead'])
+  })
+
+  it('rejects an effort-only option for a transport provider that inherits parent context', async () => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    await expect(spawn(ctx, lead, 'fork-transport-effort', {
+      provider: 'fork',
+      agentOptions: { reasoningEffort: ReasoningEffortId('max') },
+    })).rejects.toMatchObject({ code: 'TEAM_FORK_ROUTE_UNSUPPORTED' })
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(durable(lead).members).toEqual([])
+  })
+
+  it('forwards a maxTokens-only option through a transport provider that inherits parent context', async () => {
+    const { ctx, lead } = await setup([textResponse('lead turn'), textResponse('budgeted fork answer')])
+    lead.followup(createUserMessage({ content: content('lead turn'), source: { kind: 'user' } }))
+    await lead.whenIdle()
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const started = await spawn(ctx, lead, 'fork-budget-transport', {
+      provider: 'fork',
+      agentOptions: { maxTokens: 512 },
+    })
+    expect(startActivation.mock.calls[0]?.[0].request).toMatchObject({ agentOptions: { maxTokens: 512 } })
+    const agentOptions = startActivation.mock.calls[0]?.[0].request.agentOptions
+    expect(agentOptions).not.toHaveProperty('provider')
+    expect(agentOptions).not.toHaveProperty('model')
+    expect(agentOptions).not.toHaveProperty('reasoningEffort')
+    await waitNoAgent(ctx, started.member.id)
+  })
+
+  it('does not inherit the Lead effort when an explicit route changes without an effort', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('changed route')], {}, REASONING_EFFORTS, {
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    const started = await spawn(ctx, lead, 'route-changed', {
+      agentOptions: { provider: 'mock', model: 'mock-routed' },
+    })
+    await waitNoAgent(ctx, started.member.id)
+    expect(adapter.requests[0]?.model).toBe('mock-routed')
+    expect(adapter.requests[0]?.reasoningEffort).toBeUndefined()
+  })
+
+  it('overrides the inherited Lead effort when only an effort is supplied', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('effort override')], {}, REASONING_EFFORTS, {
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    const started = await spawn(ctx, lead, 'effort-override', {
+      agentOptions: { reasoningEffort: ReasoningEffortId('high') },
+    })
+    await waitNoAgent(ctx, started.member.id)
+    expect(adapter.requests[0]?.model).toBe('mock')
+    expect(adapter.requests[0]?.reasoningEffort).toBe('high')
+  })
+
+  it('inherits the Lead effort when creation options are omitted', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('inherited effort')], {}, REASONING_EFFORTS, {
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    const started = await spawn(ctx, lead, 'inherit-effort')
+    await waitNoAgent(ctx, started.member.id)
+    expect(adapter.requests[0]?.model).toBe('mock')
+    expect(adapter.requests[0]?.reasoningEffort).toBe('max')
   })
 })

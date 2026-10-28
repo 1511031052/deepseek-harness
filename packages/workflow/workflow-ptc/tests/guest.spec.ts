@@ -2,17 +2,23 @@ import { execFile } from 'node:child_process'
 import { setImmediate } from 'node:timers/promises'
 import { promisify } from 'node:util'
 import { describe, expect, it, onTestFinished } from 'vitest'
+import type { WorkflowMeta } from '@deepseek-ai/dsh-workflow'
 import { runWorkflowGuest } from '../src/guest.ts'
 import { WORKFLOW_GUEST_SOURCE } from '../src/guest-source.ts'
 import type { WorkflowGuestHost, WorkflowProgress } from '../src/guest-types.ts'
 import type { ChildResult, ChildStartRequest, WorkerInit, WorkerLimits } from '../src/types.ts'
 
-function fixture(body: string, overrides: Partial<WorkflowGuestHost> = {}, limits: Partial<WorkerLimits> = {}) {
+function fixture(
+  body: string,
+  overrides: Partial<WorkflowGuestHost> = {},
+  limits: Partial<WorkerLimits> = {},
+  meta: Partial<WorkflowMeta> = {},
+) {
   const requests: ChildStartRequest[] = []
   const events: WorkflowProgress[] = []
   const disposed: number[] = []
   const init: WorkerInit = {
-    meta: { name: 'guest-test', description: 'exercise workflow guest callbacks' },
+    meta: { name: 'guest-test', description: 'exercise workflow guest callbacks', ...meta },
     body,
     args: { prompt: 'answer this' },
     limits: { maxConcurrentAgents: 4, maxTotalAgents: 8, maxItemsPerCall: 8, syncTimeoutMs: 5000, ...limits },
@@ -230,6 +236,49 @@ describe('workflow guest callbacks', () => {
   })
 })
 
+describe('workflow child LLM route options', () => {
+  it('applies a matching phase route, including its effort, to its agents', async () => {
+    const test = fixture(
+      `phase('Route'); return await agent('work')`,
+      {},
+      {},
+      { phases: [{ title: 'Route', provider: 'alpha', model: 'small', reasoning_effort: 'max' }] },
+    )
+    await expect(runWorkflowGuest(test.host)).resolves.toMatchObject({ value: 'work', stopReason: 'completed' })
+    expect(test.requests).toEqual([{ prompt: 'work', provider: 'alpha', model: 'small', reasoning_effort: 'max' }])
+  })
+
+  it('drops a phase effort when the call changes that phase route', async () => {
+    const test = fixture(
+      `phase('Route'); return await agent('work', { provider: 'beta', model: 'wide' })`,
+      {},
+      {},
+      { phases: [{ title: 'Route', provider: 'alpha', model: 'small', reasoning_effort: 'max' }] },
+    )
+    await expect(runWorkflowGuest(test.host)).resolves.toMatchObject({ value: 'work', stopReason: 'completed' })
+    expect(test.requests).toEqual([{ prompt: 'work', provider: 'beta', model: 'wide' }])
+  })
+
+  it('forwards an explicit effort that overrides the phase default', async () => {
+    const test = fixture(
+      `phase('Route'); return await agent('work', { reasoning_effort: 'low' })`,
+      {},
+      {},
+      { phases: [{ title: 'Route', reasoning_effort: 'max' }] },
+    )
+    await expect(runWorkflowGuest(test.host)).resolves.toMatchObject({ value: 'work', stopReason: 'completed' })
+    expect(test.requests).toEqual([{ prompt: 'work', reasoning_effort: 'low' }])
+  })
+
+  it('rejects an unpaired provider or model in agent() options', async () => {
+    for (const route of ['{ provider: "alpha" }', '{ model: "small" }']) {
+      const result = await runWorkflowGuest(fixture(`return await agent("work", ${route})`).host)
+      expect(result.stopReason).toBe('error')
+      expect(result.error).toContain('requires `provider` and `model` together')
+    }
+  })
+})
+
 describe('workflow child results', () => {
   it.each([
     ['failed child', { output: [], stopReason: 'error' }],
@@ -325,6 +374,7 @@ describe('workflow script validation', () => {
     ['return await agent("x", {effort: "high"})', 'deferred and not supported'],
     ['return await agent("x", {unknown: true})', 'not recognized'],
     ['return await agent("x", {label: 1})', 'must be a string'],
+    ['return await agent("x", {reasoning_effort: 1})', 'must be a string'],
     ['return await agent("x", {schema: {type: "object", pattern: "x"}})', 'outside the supported subset'],
     ['return await parallel(1)', 'requires an array'],
     ['return await parallel([1])', 'not a function'],

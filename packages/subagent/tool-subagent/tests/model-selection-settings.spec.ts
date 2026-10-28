@@ -16,10 +16,7 @@ import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import * as tool from '../src/index.ts'
 import SubagentModelSelectionConfig from '../src/model-selection-settings.ts'
-import {
-  subagentModelSelectionPolicy,
-  subagentModelSelectionProjectionDefinition,
-} from '../src/model-selection-state.ts'
+import { subagentModelSelectionPolicy } from '@deepseek-ai/dsh-subagent/model-selection'
 import { callSubagent, text } from './harness.ts'
 
 const ALLOWED_MODELS = [{ provider: 'alpha', model: 'fast-model' }]
@@ -105,7 +102,8 @@ describe('SubagentModelSelectionConfig', () => {
 
     selectionConfigs.set(ctx, await liveConfig(ctx, SubagentModelSelectionConfig))
     await ctx.plugin(SessionProjectionRegistry)
-    ctx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
+    await mountWorkingDirectoryFixture(ctx)
+    await ctx.plugin(SubagentRuntime)
 
     // A stored policy the service cannot apply fails when it is read, not when the profile row is written.
     await selectionConfigs.get(ctx)!.update({ allowedModels: [...ALLOWED_MODELS, ...ALLOWED_MODELS] })
@@ -131,6 +129,23 @@ describe('SubagentModelSelectionConfig', () => {
     } as never)
     expect(() => subagentModelSelectionPolicy(ctx.sessionProjections, malformed))
       .toThrow('requires non-empty provider and model ids')
+    await ctx.fiber.dispose()
+  })
+
+  it('leaves the shared policy projection registration to the subagent service', async () => {
+    const ctx = new Context()
+    await mountAgentLoopTestDependencies(ctx)
+    await mountWorkingDirectoryFixture(ctx)
+    const register = vi.spyOn(ctx.sessionProjections, 'register')
+    const policyRegistrations = () => register.mock.calls
+      .filter(([definition]) => definition.key === 'subagentModelSelectionPolicy').length
+
+    await ctx.plugin(SubagentRuntime)
+    expect(policyRegistrations()).toBe(1)
+
+    await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
+    await ctx.plugin(tool, { provider: 'spawn' })
+    expect(policyRegistrations()).toBe(1)
     await ctx.fiber.dispose()
   })
 

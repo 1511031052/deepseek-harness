@@ -103,10 +103,19 @@ kind: "package-reference"
 | [`src/descriptor.ts`](src/descriptor.ts) | 版本化的 `subagent/descriptor` 会话事件词汇 |
 | [`src/catalog.ts`](src/catalog.ts) | parent 自有的 `subagent/catalog` 事件与分块 host projection |
 | [`src/child-agent.ts`](src/child-agent.ts) | 子级组装、委派策略、深度辅助函数 |
+| [`src/model-selection.ts`](src/model-selection.ts) | 共享的子级 LLM 路由词汇、Session 白名单策略、适配器预检与执行边界 guard（`@deepseek-ai/dsh-subagent/model-selection`） |
 | [`src/list-children.ts`](src/list-children.ts) | 直接与递归的 parent 目录读取 |
 | [`src/control.ts`](src/control.ts) | 浏览器控制请求校验与稳定失败分码 |
 | [`src/control-types.ts`](src/control-types.ts) | client-safe 的目录行、控制面请求、回执与失败 |
 | [`src/archive-admission.ts`](src/archive-admission.ts) | Workspace 注册表归档准入中的 `subagent` 族：运行中的子孙及其父级取消 |
+
+### 共享子级 LLM 路由选择
+
+每条能选择子级路由的委派路径都使用 `@deepseek-ai/dsh-subagent/model-selection` 的同一套规则：`subagent` 工具与 workflow 引擎在面向模型的入口检查，Team 工具把路由选项透传给服务，`startActivation` 本身在执行边界再检查一次。该模块拥有精确路由词汇、provider/model 成对规则、把模型字段合并到配置默认值之上的规则（改变路由但未给 effort 时清除原路由自有的 effort）、实时 `llm.resolveCallConfig` 预检，以及 Session 白名单断言。
+
+白名单本身是持久 Session 状态：启用选择能力的定义记录一次 `subagent/model-selection-policy`，`subagentModelSelectionPolicy` host projection 折叠它，`subagentModelSelectionPolicy()` 读取分离后的路由列表。该 projection 由 subagent 服务注册，定义所有者与消费者都不再重复注册。收到显式路由或 effort 字段的模型入口必须用 `requireSubagentModelSelectionPolicy()` 要求该策略，并在 Session 没有策略时失败——这些入口的显式选择绝不回退到继承路由。
+
+`startActivation` 会在任何提供方创建子级之前独立解析每个显式 `request.agentOptions`。Session 记录了策略时，有效 provider/model 必须命中允许路由；缺少有效路由或未公布的 effort 都在此失败；非白名单路由不会回退。Session 没有记录策略时，直接服务调用方保留策略引入前的配置与服务兼容路径：显式配置值仍然可用，但仍须通过实时适配器预检。面向模型的工具与 workflow 引擎仍会在调用服务之前对无策略的显式选择失败关闭。显式选择需要 `sessionProjections` 服务来判断是否存在策略；没有该服务的组合会拒绝，而不是绕过白名单。纯继承与仅覆盖 `maxTokens` 不读取策略，也不执行路由预检。
 
 ### 提供方准备与结构化输出
 

@@ -1,9 +1,28 @@
-/** Child LLM route selection for the subagent tool. */
+/**
+ * Child LLM route selection shared by every delegation consumer and by the
+ * execution boundary itself: the model-facing subagent tool, the workflow
+ * engine, the Team tool's route contract, and `SubagentRuntime.startActivation`.
+ * One home owns the exact-route vocabulary, the pairing rules, the Session-owned
+ * allowlist assertion, and the live-adapter preflight, so entry checks and the
+ * operation that creates the child cannot drift.
+ *
+ * The tool and workflow entry points fail closed when an explicit selection has
+ * no recorded policy. The service boundary instead keeps a no-policy
+ * compatibility path for configured callers while still running the live
+ * preflight; see {@link preflightChildLlmRoute} and
+ * {@link subagentModelSelectionPolicy}.
+ *
+ * @module @deepseek-ai/dsh-subagent/model-selection
+ */
 
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { LlmRuntime } from '@deepseek-ai/dsh-llm'
 import type { AgentOptions } from '@deepseek-ai/dsh-agent'
+import type { Session } from '@deepseek-ai/dsh-session'
+import type SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import z from '@deepseek-ai/schemastery'
+import { z as zod } from 'zod'
 
 /** One exact child LLM route authorized by a user setting. */
 export interface AllowedModelRoute {
@@ -24,6 +43,50 @@ export interface ModelSelectionPolicy {
   /** Exact provider/model routes authorized for explicit selection. */
   readonly routes: readonly AllowedModelRoute[]
 }
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    /**
+     * Records that this session's delegation consumers expose child provider,
+     * model, and reasoning-effort selection. Appended before the first model
+     * request; absence means fixed-route delegation. Log-only: it carries no
+     * `surfaceOp` and never enters model history.
+     */
+    'subagent/model-selection-policy': {
+      /** Exact routes this Session may select explicitly for a child. */
+      allowedModels: AllowedModelRoute[]
+    }
+  }
+}
+
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    /** Exact routes authorized for child LLM selection, or null when disabled. */
+    subagentModelSelectionPolicy: AllowedModelRoute[] | null
+  }
+}
+
+const modelSelectionPolicySchema: zod.ZodType<AllowedModelRoute[] | null> = zod.array(zod.object({
+  provider: zod.string().min(1),
+  model: zod.string().min(1),
+}).strict()).min(1).nullable()
+
+/** Host-only projection of the durable model-selection policy. */
+export const subagentModelSelectionProjectionDefinition = {
+  key: 'subagentModelSelectionPolicy',
+  stateVersion: 1,
+  stateSchema: modelSelectionPolicySchema,
+  init: () => null,
+  apply: (policy, event) => {
+    if (policy !== null || event.type !== 'subagent/model-selection-policy') return policy
+    const { allowedModels } = event.data
+    assertAllowedModelRoutes(allowedModels)
+    if (allowedModels.length === 0) {
+      throw new Error('subagent/model-selection-policy requires at least one route')
+    }
+    return allowedModels
+  },
+} satisfies ProjectionDefinition<'subagentModelSelectionPolicy', AllowedModelRoute[] | null>
 
 /**
  * Stable identity for one provider/model pair.
@@ -91,9 +154,9 @@ function assertNonEmpty(value: string | undefined, field: keyof DelegationModelR
  * Provider and model form one route and must be supplied together. Changing
  * that route without an effort clears the configured route-owned effort.
  * @param parentOptions - Current parent values that supply missing child values.
- * @param configured - Tool-instance child defaults.
+ * @param configured - Tool-instance or provider child defaults.
  * @param request - Model-facing route override.
- * @param enabled - Whether this tool instance permits model-facing selection.
+ * @param enabled - Whether this consumer permits model-facing selection.
  * @returns Child Agent options, preserving omission when no layer contributes one.
  */
 export function requestedAgentOptions(
@@ -193,4 +256,56 @@ export async function preflightChildLlmRoute(
     model,
     ...reasoningEffort === undefined ? {} : { reasoningEffort },
   }, signal)
+}
+
+/**
+ * Read the exact route list captured for a model-selectable Session. Returns
+ * `undefined` when the projection is not registered and when the Session
+ * recorded the disabled policy, so consumers fail closed on either.
+ * @param projections - registry that owns the policy projection.
+ * @param session - session whose durable decision is read.
+ * @returns a detached route list, or undefined when no policy is enabled.
+ */
+export function subagentModelSelectionPolicy(
+  projections: Pick<SessionProjectionRegistry, 'stateOf'>,
+  session: Session,
+): AllowedModelRoute[] | undefined {
+  return projections.stateOf(session, 'subagentModelSelectionPolicy')?.map(route => ({ ...route }))
+}
+
+/**
+ * Require an enabled Session policy for an explicit child LLM selection.
+ * Explicit selection never falls back to the inherited route: a consumer that
+ * receives route or effort fields must have a recorded allowlist to check them
+ * against.
+ * @param projections - registry that owns the policy projection.
+ * @param session - Session whose recorded policy authorizes the selection.
+ * @returns the detached allowed route list.
+ */
+export function requireSubagentModelSelectionPolicy(
+  projections: Pick<SessionProjectionRegistry, 'stateOf'>,
+  session: Session,
+): readonly AllowedModelRoute[] {
+  const routes = subagentModelSelectionPolicy(projections, session)
+  if (routes === undefined) {
+    throw new Error('explicit child LLM selection requires an enabled model-selection policy for this Session')
+  }
+  return routes
+}
+
+/**
+ * Append the route policy once, before it can reach a model request.
+ * @param projections - registry that owns the policy projection.
+ * @param session - session receiving the model-selectable definition.
+ * @param allowedModels - exact routes the definition may select explicitly.
+ */
+export function recordSubagentModelSelection(
+  projections: Pick<SessionProjectionRegistry, 'stateOf'>,
+  session: Session,
+  allowedModels: readonly AllowedModelRoute[],
+): void {
+  if (subagentModelSelectionPolicy(projections, session) !== undefined) return
+  session.append('subagent/model-selection-policy', {
+    allowedModels: allowedModels.map(route => ({ ...route })),
+  })
 }

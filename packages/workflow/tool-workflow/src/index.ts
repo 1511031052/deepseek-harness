@@ -158,7 +158,7 @@ function createWorkflowRecorder(ctx: Context): WorkflowRecorder {
 const DESCRIPTION = `Run a JavaScript workflow script that orchestrates subagents at scale. Use this for work that fans out across many independent pieces — an audit over many files, a migration, multi-angle research, adversarial verification of findings — where you write the orchestration as a script instead of delegating turn by turn.
 
 Script-body hooks:
-- \`agent(prompt, opts?): Promise<any>\` — run one subagent to completion. Without \`opts.schema\` it resolves to the child's final text; with \`opts.schema\` (an object-rooted JSON Schema using ONLY type/properties/required/additionalProperties/items/enum/const/oneOf) it resolves to the validated object. Resolves \`null\` when the child fails (filter with \`.filter(Boolean)\`). Other opts: \`label\` (display), \`phase\` (progress group), and independent \`provider\`/\`model\` LLM target overrides.
+- \`agent(prompt, opts?): Promise<any>\` — run one subagent to completion. Without \`opts.schema\` it resolves to the child's final text; with \`opts.schema\` (an object-rooted JSON Schema using ONLY type/properties/required/additionalProperties/items/enum/const/oneOf) it resolves to the validated object. Resolves \`null\` when the child fails (filter with \`.filter(Boolean)\`). Other opts: \`label\` (display), \`phase\` (progress group), and the child LLM route fields \`provider\`/\`model\` (supply both together) plus \`reasoning_effort\`. A matching \`meta.phases\` declaration supplies the default route and effort for that call; a route or effort given on the call is an explicit selection that overrides the phase default. An explicit route must appear in this Session's allowed model list, and the call fails instead of falling back when the Session has no such policy. Omit all three to inherit the parent route only when the matching phase declares no route and no effort; otherwise the phase declaration is the call's default. Changing provider or model without an effort never carries a phase or parent effort over: the selected model's default applies.
 - \`pipeline(items, ...stages): Promise<any[]>\` — run each item through the stages independently with NO barrier between stages (prefer this for multi-stage work). Each stage receives \`(prev, item, index)\`. A stage throw drops that ITEM to \`null\` and skips its remaining stages.
 - \`parallel(thunks): Promise<any[]>\` — run zero-argument functions concurrently and await ALL of them (a barrier; use only when a stage genuinely needs every prior result together). A throwing thunk resolves to \`null\`.
 - \`phase(title)\` — start a progress phase; \`log(message)\` — narrate progress; \`args\` — the tool call's \`args\` input, verbatim.
@@ -171,7 +171,13 @@ type WorkflowCallArgs = {
     name: string
     description: string
     whenToUse?: string
-    phases?: { title: string; detail?: string; provider?: string; model?: string }[]
+    phases?: {
+      title: string
+      detail?: string
+      provider?: string
+      model?: string
+      reasoning_effort?: string
+    }[]
   }
   args?: Record<string, unknown>
   run_in_background?: boolean
@@ -349,15 +355,16 @@ export function apply(ctx: Context, config: Config): void {
           whenToUse: { type: 'string', description: 'Optional guidance on when this workflow applies.' },
           phases: {
             type: 'array',
-            description: 'Optional phase declarations matched by phase() calls.',
+            description: 'Optional phase declarations matched by phase() calls. Their provider/model/reasoning_effort are the default child LLM route and effort for agent() calls in the phase; a route or effort given on the call overrides them.',
             items: {
               type: 'object',
               additionalProperties: true,
               properties: {
                 title: { type: 'string', required: true, description: 'The phase title phase() calls match by exact string.' },
                 detail: { type: 'string', description: 'Optional one-line description of the phase.' },
-                provider: { type: 'string', description: 'Optional provider override this phase is expected to use.' },
-                model: { type: 'string', description: 'Optional model override this phase is expected to use.' },
+                provider: { type: 'string', description: 'Optional provider default for this phase\'s agents. Supply together with model.' },
+                model: { type: 'string', description: 'Optional model default for this phase\'s agents. Supply together with provider.' },
+                reasoning_effort: { type: 'string', description: 'Optional reasoning-effort default for this phase\'s agents; applies while they keep the phase route.' },
               },
             },
           },

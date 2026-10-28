@@ -33,7 +33,7 @@ The model reaches the capability through the `workflow` tool from `dsh-tool-work
 
 ### Running a workflow script
 
-An orchestration script is a plain JavaScript body (not TypeScript) that runs with top-level `await` and ends with `return <json-value>`. The `meta` identity block and any `args` arrive as plain JSON data — never evaluated code. During execution the script calls the provided hooks: `agent(prompt, opts)` starts one subagent and resolves with its final text or, with a schema, a validated structured value; `parallel()` and `pipeline()` combine independent work; `phase()` and `log()` narrate progress for observers.
+An orchestration script is a plain JavaScript body (not TypeScript) that runs with top-level `await` and ends with `return <json-value>`. The `meta` identity block and any `args` arrive as plain JSON data — never evaluated code. During execution the script calls the provided hooks: `agent(prompt, opts)` starts one subagent and resolves with its final text or, with a schema, a validated structured value; its optional `provider`/`model` route (both or neither) and `reasoning_effort` override the inherited child route, and a matching `meta.phases` entry supplies that route by default for its agents; `parallel()` and `pipeline()` combine independent work; `phase()` and `log()` narrate progress for observers.
 
 ```text
 // Script body — runs with top-level await, ends with a JSON return value:

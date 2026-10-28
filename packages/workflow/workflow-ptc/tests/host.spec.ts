@@ -2,6 +2,9 @@ import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
 import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
+import type { AgentOptions } from '@deepseek-ai/dsh-agent'
+import LlmRuntime, { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
 import { PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import type { PtcBindingFunction, PtcRunRequest, PtcRunResult, PtcRunSpec } from '@deepseek-ai/dsh-ptc-runtime'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
@@ -10,6 +13,7 @@ import SandboxPolicy from '@deepseek-ai/dsh-sandbox-policy'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import type { SubagentActivation, SubagentResult } from '@deepseek-ai/dsh-subagent'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
+import { MockAdapter } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import PtcWorkflowEngine from '../src/index.ts'
 import { fakeParent } from './setup.ts'
 
@@ -189,7 +193,7 @@ describe('workflow runtime outcomes', () => {
     const released = Promise.withResolvers<undefined>()
     const schema = { type: 'object' as const, properties: { answer: { type: 'number' as const } } }
     const { ctx, parent, start } = await setup(async (bindings) => {
-      const child = await bindings.startChild!({ prompt: 'answer', schema, model: 'selected' })
+      const child = await bindings.startChild!({ prompt: 'answer', schema })
       expect(child).toEqual({ callId: 1, childId: 'ready-child' })
       expect(await bindings.childResult!(child)).toEqual({ output: [], structured: { answer: 42 }, stopReason: 'completed' })
       await bindings.disposeChild!(child)
@@ -215,7 +219,7 @@ describe('workflow runtime outcomes', () => {
         provider: 'stub', label: 'host-test child 1', delivery: 'caller',
         request: {
           cwd: ctx.workingDirectory.get(parent.session),
-          prompt: [{ type: 'text', text: 'answer' }], outputSchema: schema, agentOptions: { model: 'selected' },
+          prompt: [{ type: 'text', text: 'answer' }], outputSchema: schema,
         },
       })
       released.resolve(undefined)
@@ -320,5 +324,187 @@ describe('workflow runtime outcomes', () => {
       childResult.resolve({ output: [], stopReason: 'aborted' })
       await handle.dispose()
     }
+  })
+})
+
+const REASONING: LlmModelReasoningInfo = {
+  efforts: [
+    { id: ReasoningEffortId('low'), name: 'Low' },
+    { id: ReasoningEffortId('high'), name: 'High' },
+    { id: ReasoningEffortId('max'), name: 'Max' },
+  ],
+  defaultEffort: ReasoningEffortId('high'),
+}
+
+const ALLOWED = [{ provider: 'alpha', model: 'small' }] as const
+
+/**
+ * Mount a workflow run whose script starts a routed child. The live LLM
+ * runtime advertises `low`/`high`/`max`, and the parent Session records the
+ * supplied allowlist, so each test exercises the production policy path.
+ */
+async function routeSetup(
+  execute: (bindings: HostBindings) => Promise<PtcRunResult>,
+  allowedModels: readonly { provider: string; model: string }[] | null = ALLOWED,
+) {
+  const test = await setup(execute)
+  await test.ctx.plugin(LlmRuntime)
+  test.ctx.llm.registerAdapter(['alpha', 'beta'], new MockAdapter([], REASONING))
+  if (allowedModels !== null) {
+    test.parent.session.append('subagent/model-selection-policy', {
+      allowedModels: allowedModels.map(route => ({ ...route })),
+    })
+  }
+  return test
+}
+
+/** Publish one child so the host's route resolution is the only failure source. */
+function stubStartActivation(ctx: Context) {
+  return vi.spyOn(ctx.subagents, 'startActivation').mockResolvedValue({
+    childId: SessionId('routed-child'),
+    result: Promise.resolve({ output: [], stopReason: 'completed' }),
+    dispose: () => Promise.resolve(),
+  })
+}
+
+describe('workflow child LLM route selection', () => {
+  it('forwards provider, model, and reasoning_effort into startActivation', async () => {
+    const { ctx, start } = await routeSetup(async (bindings) => {
+      const child = await bindings.startChild!({ prompt: 'routed', provider: 'alpha', model: 'small', reasoning_effort: 'max' })
+      await bindings.disposeChild!(child)
+      return completed
+    })
+    const activation = stubStartActivation(ctx)
+    const resolve = vi.spyOn(ctx.llm, 'resolveCallConfig')
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason, result.error).toBe('completed')
+    } finally { await handle.dispose() }
+    expect(activation).toHaveBeenCalledOnce()
+    expect(activation.mock.calls[0]![0].request.agentOptions).toEqual({
+      provider: 'alpha', model: 'small', reasoningEffort: 'max',
+    })
+    expect(resolve).toHaveBeenCalledOnce()
+    expect(resolve.mock.calls[0]![0]).toEqual({ provider: 'alpha', model: 'small', reasoningEffort: 'max' })
+  })
+
+  it('applies an effort-only selection to the inherited route under the same allowlist', async () => {
+    const { ctx, parent, start } = await routeSetup(async (bindings) => {
+      const child = await bindings.startChild!({ prompt: 'effort', reasoning_effort: 'max' })
+      await bindings.disposeChild!(child)
+      return completed
+    })
+    ;(parent as { options: AgentOptions }).options = { provider: 'alpha', model: 'small' }
+    const activation = stubStartActivation(ctx)
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason, result.error).toBe('completed')
+    } finally { await handle.dispose() }
+    expect(activation.mock.calls[0]![0].request.agentOptions).toEqual({ reasoningEffort: 'max' })
+  })
+
+  it('fails a route outside the Session allowlist without starting the child', async () => {
+    const { ctx, start } = await routeSetup(async (bindings) => {
+      await bindings.startChild!({ prompt: 'routed', provider: 'beta', model: 'wide' })
+      return completed
+    })
+    const activation = stubStartActivation(ctx)
+    const resolve = vi.spyOn(ctx.llm, 'resolveCallConfig')
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason).toBe('error')
+      expect(result.error).toContain('child LLM route "beta/wide" is not allowed for this Session')
+    } finally { await handle.dispose() }
+    expect(activation).not.toHaveBeenCalled()
+    expect(resolve).not.toHaveBeenCalled()
+  })
+
+  it('fails explicit selection when the Session records no enabled policy', async () => {
+    const { ctx, start } = await routeSetup(async (bindings) => {
+      await bindings.startChild!({ prompt: 'routed', provider: 'alpha', model: 'small' })
+      return completed
+    }, null)
+    const activation = stubStartActivation(ctx)
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason).toBe('error')
+      expect(result.error).toContain('explicit child LLM selection requires an enabled model-selection policy for this Session')
+    } finally { await handle.dispose() }
+    expect(activation).not.toHaveBeenCalled()
+  })
+
+  it('rejects a provider without its model before the child exists', async () => {
+    const { ctx, start } = await routeSetup(async (bindings) => {
+      await bindings.startChild!({ prompt: 'half', model: 'small' })
+      return completed
+    })
+    const activation = stubStartActivation(ctx)
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason).toBe('error')
+      expect(result.error).toContain('`provider` and `model` must be supplied together')
+    } finally { await handle.dispose() }
+    expect(activation).not.toHaveBeenCalled()
+  })
+
+  it('rejects an effort the selected model does not advertise', async () => {
+    const { ctx, start } = await routeSetup(async (bindings) => {
+      await bindings.startChild!({ prompt: 'routed', provider: 'alpha', model: 'small', reasoning_effort: 'ultra' })
+      return completed
+    })
+    const activation = stubStartActivation(ctx)
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason).toBe('error')
+      expect(result.error).toContain('does not support reasoning effort "ultra"')
+    } finally { await handle.dispose() }
+    expect(activation).not.toHaveBeenCalled()
+  })
+
+  it('clears an inherited effort when the route changes without a new one', async () => {
+    const { ctx, parent, start } = await routeSetup(async (bindings) => {
+      const child = await bindings.startChild!({ prompt: 'routed', provider: 'beta', model: 'wide' })
+      await bindings.disposeChild!(child)
+      return completed
+    }, [{ provider: 'alpha', model: 'small' }, { provider: 'beta', model: 'wide' }])
+    ;(parent as { options: AgentOptions }).options = {
+      provider: 'alpha', model: 'small', reasoningEffort: ReasoningEffortId('high'),
+    }
+    const activation = stubStartActivation(ctx)
+    const resolve = vi.spyOn(ctx.llm, 'resolveCallConfig')
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason, result.error).toBe('completed')
+    } finally { await handle.dispose() }
+    expect(activation.mock.calls[0]![0].request.agentOptions).toEqual({ provider: 'beta', model: 'wide' })
+    expect(resolve.mock.calls[0]![0]).toEqual({ provider: 'beta', model: 'wide' })
+  })
+
+  it('keeps the inherited route when the call selects nothing', async () => {
+    const { ctx, start } = await routeSetup(async (bindings) => {
+      const child = await bindings.startChild!({ prompt: 'plain' })
+      await bindings.disposeChild!(child)
+      return completed
+    }, null)
+    const activation = stubStartActivation(ctx)
+    const resolve = vi.spyOn(ctx.llm, 'resolveCallConfig')
+    const policy = vi.spyOn(ctx.sessionProjections, 'stateOf')
+    const handle = start()
+    try {
+      const result = await handle.result
+      expect(result.stopReason, result.error).toBe('completed')
+    } finally { await handle.dispose() }
+    expect(activation).toHaveBeenCalledOnce()
+    expect(activation.mock.calls[0]![0].request.agentOptions).toBeUndefined()
+    expect(resolve).not.toHaveBeenCalled()
+    const policyReads = policy.mock.calls.filter(([, key]) => key === 'subagentModelSelectionPolicy')
+    expect(policyReads).toHaveLength(0)
   })
 })

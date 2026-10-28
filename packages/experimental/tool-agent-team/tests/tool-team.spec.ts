@@ -3,15 +3,20 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId, ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SessionQueryEngine from '@deepseek-ai/dsh-session-query'
-import SubagentService from '@deepseek-ai/dsh-subagent'
+import SubagentService, { foldSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
+import {
+  recordSubagentModelSelection,
+  subagentModelSelectionProjectionDefinition,
+} from '@deepseek-ai/dsh-subagent/model-selection'
+import type { AllowedModelRoute } from '@deepseek-ai/dsh-subagent/model-selection'
 import * as SubagentFork from '@deepseek-ai/dsh-subagent-fork-in-process'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import { renderPrompt, renderContextSnapshot } from '@deepseek-ai/dsh-system-prompt'
@@ -19,7 +24,7 @@ import * as ToolSubagentControl from '@deepseek-ai/dsh-tool-subagent-control'
 import { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
 import { serialize } from '@deepseek-ai/dsh-llm-deepseek/src/serialize.ts'
-import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmModelReasoningInfo } from '@deepseek-ai/dsh-llm'
 import { MockAdapter, textResponse, toolCallResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
 import { mountWorkingDirectoryFixture } from '../../../subagent/subagent/tests/working-directory-fixture.ts'
 import TeamService from '../../agent-team/src/index.ts'
@@ -52,6 +57,17 @@ const roots: string[] = []
 const contexts = new Set<Context>()
 let callNumber = 0
 
+/** Adapter reasoning metadata that advertises the `max` effort used by route tests. */
+const MAX_EFFORT: LlmModelReasoningInfo = { efforts: [{ id: ReasoningEffortId('max'), name: 'max' }] }
+/** Adapter reasoning metadata that lets a Lead carry and a child override a real effort. */
+const REASONING_EFFORTS: LlmModelReasoningInfo = {
+  efforts: [
+    { id: ReasoningEffortId('low'), name: 'low' },
+    { id: ReasoningEffortId('high'), name: 'high' },
+    { id: ReasoningEffortId('max'), name: 'max' },
+  ],
+}
+
 /** Session query implementation whose search faces are outside these tests. */
 class TestSessionQuery extends SessionQueryEngine {
   override searchSessions(): Promise<never> {
@@ -69,10 +85,19 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
-async function setup(script: ConstructorParameters<typeof MockAdapter>[0], legacyControl = false) {
+async function setup(
+  script: ConstructorParameters<typeof MockAdapter>[0],
+  legacyControl = false,
+  reasoning?: LlmModelReasoningInfo,
+  leadOptions: AgentOptions = {},
+) {
   const ctx = new Context()
   contexts.add(ctx)
   await mountAgentLoopTestDependencies(ctx)
+  // The installed rc.3 SubagentService predates this projection. The central
+  // guard patch registers it in production; registering the shared definition
+  // here is ref-counted by key and harmless once both patches merge.
+  ctx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
   await mountWorkingDirectoryFixture(ctx)
   const storageRoot = mkdtempSync(join(tmpdir(), 'dsh-tool-team-'))
   roots.push(storageRoot)
@@ -85,10 +110,15 @@ async function setup(script: ConstructorParameters<typeof MockAdapter>[0], legac
   await ctx.plugin(SubagentFork, { providerName: 'fork' })
   await ctx.plugin(TeamService)
   const fiber = await ctx.plugin(toolTeam)
-  const adapter = new MockAdapter(script)
+  const adapter = new MockAdapter(script, reasoning)
   ctx.llm.registerAdapter(['mock'], adapter)
-  const lead = await ctx.agentLoop.create(SessionId('tool-team-lead'), { provider: 'mock', model: 'mock' })
+  const lead = await ctx.agentLoop.create(SessionId('tool-team-lead'), { provider: 'mock', model: 'mock', ...leadOptions })
   return { ctx, lead, fiber, adapter }
+}
+
+/** Record one Session-owned allowlist, as an entitled deployment does before delegation. */
+function allowRoutes(ctx: Context, agent: Agent, routes: readonly AllowedModelRoute[]): void {
+  recordSubagentModelSelection(ctx.sessionProjections, agent.session, routes)
 }
 
 function execute(
@@ -777,5 +807,199 @@ describe('dsh-tool-team', () => {
     const childId = spawnedChildId(ctx, lead, result)
     await vi.waitFor(() => { expect(ctx.agents.get(childId)).toBeUndefined() }, { timeout: 5_000 })
     expect(ctx.agentTeams.listMembers(lead)[1]).toMatchObject({ provider: 'team-fresh' })
+  })
+
+  it('forwards an explicit fresh teammate LLM route into startActivation', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('routed answer')], false, MAX_EFFORT)
+    allowRoutes(ctx, lead, [{ provider: 'mock', model: 'mock-routed' }])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'routed',
+      description: 'routed worker',
+      prompt: 'finish the routed task',
+      provider: 'mock',
+      model: 'mock-routed',
+      reasoning_effort: 'max',
+    })
+    expect(spawned.isError, text(spawned)).toBe(false)
+    expect(startActivation.mock.calls[0]?.[0].request).toMatchObject({
+      agentOptions: { provider: 'mock', model: 'mock-routed', reasoningEffort: 'max' },
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitNoAgent(ctx, childId)
+    expect(adapter.requests[0]?.model).toBe('mock-routed')
+    expect(adapter.requests[0]?.reasoningEffort).toBe('max')
+    await using persisted = await ctx.sessionPersistence.open(childId, 'read')
+    const { events } = await persisted.read()
+    expect(foldSubagentDescriptor(events)).toMatchObject({
+      agentProvider: 'mock',
+      agentModel: 'mock-routed',
+      agentReasoningEffort: 'max',
+    })
+  })
+
+  it('forwards a provider and model route without an effort', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('route only answer')])
+    allowRoutes(ctx, lead, [{ provider: 'mock', model: 'mock-routed' }])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'route-only', description: 'route only', prompt: 'finish', provider: 'mock', model: 'mock-routed',
+    })
+    expect(spawned.isError, text(spawned)).toBe(false)
+    expect(startActivation.mock.calls[0]?.[0].request.agentOptions).toEqual({
+      provider: 'mock',
+      model: 'mock-routed',
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitNoAgent(ctx, childId)
+    expect(adapter.requests[0]?.model).toBe('mock-routed')
+    expect(adapter.requests[0]?.reasoningEffort).toBeUndefined()
+  })
+
+  it('forwards a reasoning effort override without a route pair', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('effort answer')], false, MAX_EFFORT)
+    allowRoutes(ctx, lead, [{ provider: 'mock', model: 'mock' }])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'effort', description: 'effort override', prompt: 'finish', reasoning_effort: 'max',
+    })
+    expect(spawned.isError, text(spawned)).toBe(false)
+    const agentOptions = startActivation.mock.calls[0]?.[0].request.agentOptions
+    expect(agentOptions).toEqual({ reasoningEffort: 'max' })
+    expect(agentOptions).not.toHaveProperty('provider')
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitNoAgent(ctx, childId)
+    expect(adapter.requests[0]?.model).toBe('mock')
+    expect(adapter.requests[0]?.reasoningEffort).toBe('max')
+  })
+
+  it('inherits the Lead effort without reading a policy when the call selects nothing', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('inherited answer')], false, REASONING_EFFORTS, {
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const stateOf = vi.spyOn(ctx.sessionProjections, 'stateOf')
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'inherit', description: 'inherited route', prompt: 'finish',
+    })
+    expect(spawned.isError, text(spawned)).toBe(false)
+    expect(startActivation.mock.calls[0]?.[0].request).not.toHaveProperty('agentOptions')
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitNoAgent(ctx, childId)
+    expect(adapter.requests[0]?.model).toBe('mock')
+    expect(adapter.requests[0]?.reasoningEffort).toBe('max')
+    expect(stateOf.mock.calls.filter(([, key]) => key === 'subagentModelSelectionPolicy')).toEqual([])
+  })
+
+  it('fails closed without a Session model-selection policy and creates no member', async () => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    for (const args of [
+      { provider: 'mock', model: 'mock-routed' },
+      { reasoning_effort: 'max' },
+    ] as const) {
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'unpolicied', description: 'no recorded policy', prompt: 'go', ...args,
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('explicit child LLM selection requires an enabled model-selection policy for this Session')
+    }
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(ctx.agentTeams.listMembers(lead).map(member => member.name)).toEqual(['lead'])
+  })
+
+  it('fails closed when the Session projection registry is unavailable', async () => {
+    const { ctx, lead } = await setup([])
+    const get = ctx.get.bind(ctx)
+    vi.spyOn(ctx, 'get').mockImplementation((name: string, strict?: boolean) => (
+      name === 'sessionProjections' ? undefined : get(name, strict)
+    ))
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const result = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'unprojected', description: 'no registry', prompt: 'go', provider: 'mock', model: 'mock-routed',
+    })
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('explicit teammate LLM selection requires the `sessionProjections` service')
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(ctx.agentTeams.listMembers(lead).map(member => member.name)).toEqual(['lead'])
+  })
+
+  it('uses the new model default instead of inheriting the Lead effort when the route changes', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('changed route answer')], false, REASONING_EFFORTS, {
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    allowRoutes(ctx, lead, [{ provider: 'mock', model: 'mock-routed' }])
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'changed-route', description: 'changed route', prompt: 'finish',
+      provider: 'mock', model: 'mock-routed',
+    })
+    expect(spawned.isError, text(spawned)).toBe(false)
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitNoAgent(ctx, childId)
+    expect(adapter.requests[0]?.model).toBe('mock-routed')
+    expect(adapter.requests[0]?.reasoningEffort).toBeUndefined()
+  })
+
+  it('overrides the Lead effort when only an effort is supplied', async () => {
+    const { ctx, lead, adapter } = await setup([textResponse('effort override answer')], false, REASONING_EFFORTS, {
+      reasoningEffort: ReasoningEffortId('max'),
+    })
+    allowRoutes(ctx, lead, [{ provider: 'mock', model: 'mock' }])
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'override-effort', description: 'override effort', prompt: 'finish', reasoning_effort: 'high',
+    })
+    expect(spawned.isError, text(spawned)).toBe(false)
+    const childId = spawnedChildId(ctx, lead, spawned)
+    await waitNoAgent(ctx, childId)
+    expect(adapter.requests[0]?.model).toBe('mock')
+    expect(adapter.requests[0]?.reasoningEffort).toBe('high')
+  })
+
+  it.each(['provider', 'model'] as const)('rejects %s without its route pair before creating a child', async (field) => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const result = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'partial', description: 'partial route', prompt: 'go', [field]: 'mock',
+    })
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('`provider` and `model` must be supplied together')
+    expect(startActivation).not.toHaveBeenCalled()
+  })
+
+  it('rejects empty child LLM values before creating a child', async () => {
+    const { ctx, lead } = await setup([])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    for (const [args, field] of [
+      [{ provider: '' }, 'provider'],
+      [{ provider: 'mock', model: '' }, 'model'],
+      [{ reasoning_effort: '' }, 'reasoning_effort'],
+    ] as const) {
+      const result = await execute(ctx, lead, 'spawn_teammate', {
+        name: 'empty', description: 'empty value', prompt: 'go', ...args,
+      })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain(`teammate LLM \`${field}\` must be non-empty`)
+    }
+    expect(startActivation).not.toHaveBeenCalled()
+  })
+
+  it('rejects an explicit LLM route for a fork teammate', async () => {
+    const { ctx, lead } = await setup([])
+    allowRoutes(ctx, lead, [{ provider: 'mock', model: 'mock-routed' }])
+    const startActivation = vi.spyOn(ctx.subagents, 'startActivation')
+    const result = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'forked',
+      description: 'forked route',
+      prompt: 'go',
+      context: 'fork',
+      provider: 'mock',
+      model: 'mock-routed',
+      reasoning_effort: 'max',
+    })
+    expect(result.isError).toBe(true)
+    expect(text(result)).toContain('fork teammates cannot select an explicit LLM route')
+    expect(text(result)).toContain('use context "fresh"')
+    expect(startActivation).not.toHaveBeenCalled()
+    expect(ctx.agentTeams.listMembers(lead).map(member => member.name)).toEqual(['lead'])
   })
 })

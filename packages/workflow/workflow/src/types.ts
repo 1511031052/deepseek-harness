@@ -22,18 +22,27 @@ export function WorkflowRunId(id: string): WorkflowRunId {
 }
 
 /**
- * One phase declared in a script's `meta.phases` (progress vocabulary only —
- * phases group agents in observers/UIs; they impose no execution structure).
+ * One phase declared in a script's `meta.phases` (progress vocabulary plus the
+ * child LLM route that agents joining the phase default to).
  */
 export interface WorkflowPhase {
   /** The phase title; `phase()` calls match against it by exact string. */
   title: string
   /** Optional one-line description of what the phase does. */
   detail?: string
-  /** Optional provider override this phase is expected to use (informational). */
+  /**
+   * Optional provider default for `agent()` calls whose phase title matches.
+   * Requires `model`; an explicit `agent()` route wins over this default.
+   */
   provider?: string
-  /** Optional model override this phase is expected to use (informational). */
+  /** Optional model default for matching `agent()` calls; requires `provider`. */
   model?: string
+  /**
+   * Optional reasoning-effort default for matching `agent()` calls that keep
+   * this phase's route. An `agent()` call that changes the route without an
+   * effort resolves the selected model's own default instead.
+   */
+  reasoning_effort?: string
 }
 
 /**

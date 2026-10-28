@@ -25,7 +25,7 @@ This package lets the model create named teammates, send them messages, inspect 
 <a id="use-this-package"></a>
 ## Use this package
 
-Add this package on top of `@deepseek-ai/dsh-experimental-agent-team` when the model should run a team through tools. Once mounted, every team member — the Lead and each teammate — gets the same nine tools plus the same coordination policy. Each member receives its current role and name through required runtime context; `spawn_teammate` sends the initial task unchanged.
+Add this package on top of `@deepseek-ai/dsh-experimental-agent-team` when the model should run a team through tools. Once mounted, every team member — the Lead and each teammate — gets the same nine tools plus the same coordination policy. Each member receives its current role and name through required runtime context; `spawn_teammate` sends the initial task unchanged. A fresh teammate may also pin its child LLM route; a fork teammate keeps the Lead route.
 
 ### When to choose it
 
@@ -56,16 +56,20 @@ Try it by asking the Lead model: "create a teammate named reviewer to check the 
 
 The nine tools group into four capabilities:
 
-- **Create a teammate** — `spawn_teammate` takes a name, a description, and the initial task; only the Lead can call it.
+- **Create a teammate** — `spawn_teammate` takes a name, a description, the initial task, and optional child LLM route fields; only the Lead can call it.
 - **Send messages** — `send_message` steers a running member at its nearest step boundary, starts or resumes an inactive member.
 - **See and wait** — `list_agents` returns each member’s `target` and availability; `wait_agent` waits for the next team change; `interrupt_agent` stops a teammate's current turn (Lead only).
 - **Manage the task board** — `team_task_create`, `team_task_list`, `team_task_get`, and `team_task_update` add, browse, read, and update shared tasks.
 
 Creation and listing results identify members by `target`, with no member Session ID. Use that value in message and interrupt calls or the task tools’ `owner` parameter; task `ownerName` uses the same value. `inactive` means no turn is executing, whether the member is loaded or must be resumed; it does not describe task completion or outcome. `provisioning` and `failed` describe member creation. Any member can message any other member and use the task board; only the Lead creates and interrupts teammates. Task updates keep the domain's owner and revision checks, so an outdated edit is rejected instead of overwriting newer work.
 
+### Teammate LLM route
+
+`provider`, `model`, and `reasoning_effort` are optional creation options for the child Agent; they never change which transport starts it. Omitting all three inherits the calling Agent's route, and only that omission skips the policy check. `provider` and `model` form one pair and must be supplied together; `reasoning_effort` may be supplied alone to override an effort inherited with an unchanged route, while changing `provider` and `model` without an effort uses the new model's default instead of the old effort. Explicit selection requires the calling Session to have recorded a model-selection policy: without one, `spawn_teammate` fails before creating any member rather than falling back to an inherited route. The Team domain only forwards the resulting options: `@deepseek-ai/dsh-subagent` authorizes the effective route against that Session policy and preflights the provider, model, and effort with the live adapter, so a rejected route fails creation with that runtime error. The Team domain also rejects an unmatched or empty `provider`/`model` pair before writing the member record. A `context: "fork"` call, and any configured transport provider whose children inherit the parent context, rejects explicit provider, model, or reasoning-effort values because that seeded prefix keeps one route; use `fresh` to pin a different route. In member results, `provider` names the creation transport (for example `spawn`), not the LLM provider, and `model` is a row hint — the live child's model, omitted while that child is not live — while the member Session header carries the authoritative route.
+
 ### What success and failure look like
 
-`send_message` returns `{ "sent": true }` after inbox acceptance, without exposing the message ID. Success does not confirm recipient processing or a synchronous storage flush; send failures are reported as tool errors. `wait_agent` returns `noProgress` right away when no other member is running or provisioning, telling the caller to wake a teammate first; otherwise it waits for the next change and the caller re-reads state afterward. Task edits based on an outdated revision are rejected rather than overwriting newer work.
+`send_message` returns `{ "sent": true }` after inbox acceptance, without exposing the message ID. Success does not confirm recipient processing or a synchronous storage flush; send failures are reported as tool errors. `wait_agent` returns `noProgress` right away when no other member is running or provisioning, telling the caller to wake a teammate first; otherwise it waits for the next change and the caller re-reads state afterward. Task edits based on an outdated revision are rejected rather than overwriting newer work. An unmatched `provider`/`model` pair, an empty route value, an explicit route without a recorded model-selection policy, or explicit route fields on a fork teammate fail before any member is created.
 
 -----
 
@@ -132,7 +136,7 @@ Fixed policy and schema cost on every Team member request. Identity is part of t
 
 #### KV Cache effect
 
-With the same provider/model, shared system policy, and tool schemas, a fork retains the parent request prefix and appends its task and current runtime context. Tool results and peer messages append after the reusable request prefix. Sessions recorded with identity inside the system prompt can change that prefix on their first request under this layout; actual provider cache hits remain best-effort.
+With the same provider/model, shared system policy, and tool schemas, a fork retains the parent request prefix and appends its task and current runtime context. Tool results and peer messages append after the reusable request prefix. Sessions recorded with identity inside the system prompt can change that prefix on their first request under this layout; actual provider cache hits remain best-effort. A fork teammate keeps the Lead route so its inherited prefix stays reusable; pinning a different route on a fresh teammate starts a separate provider-side cache namespace.
 
 ## Known Limitations and Deferred Work
 
@@ -141,6 +145,7 @@ With the same provider/model, shared system policy, and tool schemas, a fork ret
 These limits describe what the policy and tools cannot guarantee for a team. They are current package constraints, not a comparison with other collaboration surfaces.
 
 - **Prompt policy is coordination, not confinement** — it cannot stop Bash or external processes from writing overlapping files.
+- **Fork teammates cannot pin a route** — a fork inherits the Lead's LLM route, and explicit `provider`, `model`, or `reasoning_effort` is rejected; create a `fresh` teammate to pin a different route.
 - **No Web controls** — browser roster and task-board presentation is outside this runtime package.
 - **Experimental prototype with no stability promise** — the package is public, but its schemas can change freely while it incubates.
 

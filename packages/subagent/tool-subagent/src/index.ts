@@ -28,16 +28,15 @@ import {
   hasDelegationModelRequest,
   preflightChildLlmRoute,
   requestedAgentOptions,
-} from './model-selection.ts'
-import type { DelegationModelRequest, ModelSelectionPolicy } from './model-selection.ts'
+} from '@deepseek-ai/dsh-subagent/model-selection'
+import type { DelegationModelRequest, ModelSelectionPolicy } from '@deepseek-ai/dsh-subagent/model-selection'
 import { registerListSubagentModels } from './list-models.ts'
 import { SubagentPresetSelection, type PresetSelectionConfig, type PresetSelectionRequest } from './preset-selection.ts'
 import type {} from './model-selection-settings.ts'
 import {
   recordSubagentModelSelection,
-  subagentModelSelectionProjectionDefinition,
   subagentModelSelectionPolicy,
-} from './model-selection-state.ts'
+} from '@deepseek-ai/dsh-subagent/model-selection'
 
 export const name = 'tool-subagent'
 export const inject = ['tools', 'subagents', 'systemPrompt', 'sessionProjections']
@@ -159,7 +158,6 @@ export async function apply(ctx: Context, config: Config, session?: Session): Pr
   const toolName = config.toolName ?? 'subagent'
 
   const modelSelectionCapable = config.modelSelectionSettings === true
-  ctx.sessionProjections.register(subagentModelSelectionProjectionDefinition)
 
   const assertSubagentProviderConfiguration = (subagentProvider: SubagentProvider): void => {
     presets.assertProvider(subagentProvider)

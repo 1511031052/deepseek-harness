@@ -159,7 +159,7 @@ export class TeamRoster {
   /**
    * Create one named, continuable direct child of the Team Lead.
    * @param caller - exact live Lead Agent.
-   * @param request - immutable name, description, prompt, context mode, provider, and cancellation.
+   * @param request - immutable name, description, prompt, context mode, transport provider, optional LLM creation options, and cancellation.
    * @returns the active roster row.
    */
   async spawn(caller: Agent, request: SpawnTeammateRequest): Promise<SpawnTeammateResult> {
@@ -236,6 +236,7 @@ export class TeamRoster {
     }
     const signal = AbortSignal.any([request.signal, this.lifecycle.signal])
     signal.throwIfAborted()
+    this.assertCreationOptions(request)
     const root = membership.root
     const name = this.memberName(request.name)
     const description = requiredText(request.description, 'description', 200)
@@ -269,6 +270,7 @@ export class TeamRoster {
         request: {
           prompt: request.prompt,
           parent: root,
+          ...request.agentOptions === undefined ? {} : { agentOptions: request.agentOptions },
         },
         signal,
       })
@@ -429,6 +431,41 @@ export class TeamRoster {
       context: member.context,
       ...live?.options.model === undefined ? {} : { model: live.options.model },
       diagnostics: [],
+    }
+  }
+
+  /**
+   * Validate explicit LLM creation options before the member record exists.
+   * Provider and model are one pair and must be non-empty; an effort or a
+   * resource cap may stand alone. A teammate whose context inherits the Lead's
+   * completed-turn prefix keeps one route for that prefix, so any provider,
+   * model, or reasoning-effort selection is rejected there even when the
+   * configured transport provider differs from the declared context.
+   */
+  private assertCreationOptions(request: SpawnTeammateRequest): void {
+    const options = request.agentOptions
+    if (options === undefined) return
+    if (options.provider !== undefined && options.provider.length === 0) {
+      throw new TeamError('teammate LLM `provider` must be non-empty', 'TEAM_INVALID_ARGUMENT')
+    }
+    if (options.model !== undefined && options.model.length === 0) {
+      throw new TeamError('teammate LLM `model` must be non-empty', 'TEAM_INVALID_ARGUMENT')
+    }
+    if ((options.provider === undefined) !== (options.model === undefined)) {
+      throw new TeamError('teammate LLM `provider` and `model` must be supplied together', 'TEAM_INVALID_ARGUMENT')
+    }
+    if (options.provider === undefined && options.model === undefined && options.reasoningEffort === undefined) return
+    if (request.context === 'fork') {
+      throw new TeamError(
+        'fork teammates cannot select an explicit LLM route: a fork keeps the Lead route so its seeded prefix stays reusable; omit provider, model, and reasoning_effort or use context "fresh"',
+        'TEAM_FORK_ROUTE_UNSUPPORTED',
+      )
+    }
+    if (this.ctx.subagents.getProvider(request.provider)?.inheritsParentContext === true) {
+      throw new TeamError(
+        `teammate transport provider "${request.provider}" inherits the Lead context prefix and cannot select provider, model, or reasoning_effort; omit those options or use a provider that starts fresh`,
+        'TEAM_FORK_ROUTE_UNSUPPORTED',
+      )
     }
   }
 

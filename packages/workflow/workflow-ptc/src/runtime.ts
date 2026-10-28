@@ -16,6 +16,7 @@ import type {
   WorkflowAgentEndInfo,
   WorkflowAgentInfo,
   WorkflowMeta,
+  WorkflowPhase,
   WorkflowResult,
 } from '@deepseek-ai/dsh-workflow'
 import { materializeFromRealm, MaterializeError, renderThrown } from './realm.ts'
@@ -30,9 +31,18 @@ export interface ExecutionObserver {
 }
 
 /** The `agent()` options the script may pass; everything else rejects loud. */
-const SUPPORTED_AGENT_OPTIONS = new Set(['label', 'phase', 'schema', 'provider', 'model'])
+const SUPPORTED_AGENT_OPTIONS = new Set(['label', 'phase', 'schema', 'provider', 'model', 'reasoning_effort'])
 /** Deferred Claude Code options we name explicitly in the rejection message. */
 const DEFERRED_AGENT_OPTIONS = new Set(['effort', 'isolation', 'agentType'])
+/** The supported-option list every rejection message repeats. */
+const SUPPORTED_AGENT_OPTION_LIST = 'label, phase, schema, provider, model, reasoning_effort'
+
+/** One child LLM route resolved for an `agent()` call. */
+interface AgentRoute {
+  provider?: string
+  model?: string
+  reasoning_effort?: string
+}
 
 /** Flatten a child's final output blocks to text (the non-schema `agent()` result). */
 function outputText(blocks: ContentBlock[]): string {
@@ -58,6 +68,7 @@ export class WorkflowExecution {
   private started = 0
   private activeSlots = 0
   private readonly slotWaiters: (() => void)[] = []
+  private readonly phases: ReadonlyMap<string, WorkflowPhase>
   private currentPhase: string | undefined
   private readonly context: vm.Context
   private readonly compiled: vm.Script
@@ -70,6 +81,8 @@ export class WorkflowExecution {
     private readonly observer: ExecutionObserver,
     private readonly children: ChildPort,
   ) {
+    // Host-validated meta; the map only supplies per-phase route defaults.
+    this.phases = new Map((meta.phases ?? []).map(phase => [phase.title, phase] as const))
     // The host parses this same wrapper before publishing a run.
     try {
       this.compiled = new vm.Script(`(async () => {\n${body}\n})()`, {
@@ -165,6 +178,8 @@ export class WorkflowExecution {
       throw new WorkflowError('agent() requires a non-empty prompt string', 'INVALID_ARGUMENT')
     }
     const opts = this.readAgentOptions(rawOpts)
+    const phase = opts.phase ?? this.currentPhase
+    const route = this.agentRoute(opts, phase)
     if (this.started >= this.limits.maxTotalAgents) {
       throw new WorkflowError(
         `this run reached its total agent cap (${this.limits.maxTotalAgents}) — a runaway-loop backstop; raise the applicable maxTotalAgents limit if the scale is intentional`,
@@ -174,7 +189,6 @@ export class WorkflowExecution {
     this.started += 1
     const seq = this.started
     const label = opts.label ?? defaultLabel(rawPrompt)
-    const phase = opts.phase ?? this.currentPhase
 
     await this.acquireSlot()
     try {
@@ -183,8 +197,9 @@ export class WorkflowExecution {
         run = await this.children.startAgent({
           prompt: rawPrompt,
           ...opts.schema !== undefined ? { schema: opts.schema } : {},
-          ...opts.provider !== undefined ? { provider: opts.provider } : {},
-          ...opts.model !== undefined ? { model: opts.model } : {},
+          ...route.provider !== undefined ? { provider: route.provider } : {},
+          ...route.model !== undefined ? { model: route.model } : {},
+          ...route.reasoning_effort !== undefined ? { reasoning_effort: route.reasoning_effort } : {},
         })
       } catch (error: unknown) {
         throw new WorkflowError(`agent() could not start a child: ${renderThrown(error)}`, 'AGENT_START', { cause: error })
@@ -234,6 +249,7 @@ export class WorkflowExecution {
     phase?: string
     provider?: string
     model?: string
+    reasoning_effort?: string
     schema?: ObjectJsonSchema
   } {
     if (rawOpts === undefined) return {}
@@ -252,11 +268,11 @@ export class WorkflowExecution {
     for (const key of Object.keys(record)) {
       if (SUPPORTED_AGENT_OPTIONS.has(key)) continue
       if (DEFERRED_AGENT_OPTIONS.has(key)) {
-        throw new WorkflowError(`agent() option "${key}" is deferred and not supported by this engine (supported: label, phase, schema, provider, model)`, 'UNSUPPORTED_OPTION')
+        throw new WorkflowError(`agent() option "${key}" is deferred and not supported by this engine (supported: ${SUPPORTED_AGENT_OPTION_LIST})`, 'UNSUPPORTED_OPTION')
       }
-      throw new WorkflowError(`agent() option "${key}" is not recognized (supported: label, phase, schema, provider, model)`, 'UNSUPPORTED_OPTION')
+      throw new WorkflowError(`agent() option "${key}" is not recognized (supported: ${SUPPORTED_AGENT_OPTION_LIST})`, 'UNSUPPORTED_OPTION')
     }
-    for (const key of ['label', 'phase', 'provider', 'model'] as const) {
+    for (const key of ['label', 'phase', 'provider', 'model', 'reasoning_effort'] as const) {
       if (record[key] !== undefined && typeof record[key] !== 'string') {
         throw new WorkflowError(`agent() option "${key}" must be a string`, 'INVALID_ARGUMENT')
       }
@@ -277,7 +293,34 @@ export class WorkflowExecution {
       ...record.phase !== undefined ? { phase: record.phase as string } : {},
       ...record.provider !== undefined ? { provider: record.provider as string } : {},
       ...record.model !== undefined ? { model: record.model as string } : {},
+      ...record.reasoning_effort !== undefined ? { reasoning_effort: record.reasoning_effort as string } : {},
       ...schema !== undefined ? { schema } : {},
+    }
+  }
+
+  /**
+   * Resolve one `agent()` call's child LLM route from its own options and the
+   * matching phase declaration. An explicit route must name provider and model
+   * together; a phase route is the default for agents that name none. A phase
+   * effort applies only while the call keeps that phase's route, so a changed
+   * route never inherits an effort its model does not advertise.
+   */
+  private agentRoute(
+    opts: { provider?: string; model?: string; reasoning_effort?: string },
+    phaseTitle: string | undefined,
+  ): AgentRoute {
+    if ((opts.provider === undefined) !== (opts.model === undefined)) {
+      throw new WorkflowError('agent() requires `provider` and `model` together', 'INVALID_ARGUMENT')
+    }
+    const phase = phaseTitle === undefined ? undefined : this.phases.get(phaseTitle)
+    const provider = opts.provider ?? phase?.provider
+    const model = opts.model ?? phase?.model
+    const keepsPhaseRoute = provider === phase?.provider && model === phase?.model
+    const reasoningEffort = opts.reasoning_effort ?? (keepsPhaseRoute ? phase?.reasoning_effort : undefined)
+    return {
+      ...provider === undefined ? {} : { provider },
+      ...model === undefined ? {} : { model },
+      ...reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort },
     }
   }
 
